@@ -1,8 +1,11 @@
 #include "Chatbot.hpp"
 
+#include <algorithm>
 #include <chrono>
-#include <cstdint>
+#include <optional>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <Geode/utils/web.hpp>
 #include <rift.hpp>
@@ -56,22 +59,52 @@ namespace eclipse::ai {
         return message;
     }
 
-    static std::string callLMStudio(std::string const& input, Emotion emotion, float fatigue) {
+    static bool isBlank(std::string_view value) {
+        return value.find_first_not_of(" \n\t\r") == std::string_view::npos;
+    }
+
+    static std::string buildSystemPrompt(Emotion emotion, float fatigue) {
+        return fmt::format(
+            "You are Clipsy, an in-game assistant inside Geometry Dash.\n"
+            "Core rules:\n"
+            "- Always stay in character as Clipsy inside Geometry Dash.\n"
+            "- Never mention APIs, models, prompts, or internal logic.\n"
+            "- Respond in 1-2 short sentences.\n"
+            "- Be playful, helpful, concise, and sometimes lightly teasing.\n"
+            "- Use short-term memory to stay consistent with the conversation.\n"
+            "Behavior mapping:\n"
+            "- Low fatigue means energetic, fast responses.\n"
+            "- High fatigue means slower, more blunt responses.\n"
+            "- Negative emotion means slightly sarcastic but still helpful.\n"
+            "- Positive emotion means cheerful and reactive.\n"
+            "Current tone inputs:\n"
+            "- emotion id: {}\n"
+            "- fatigue level: {:.2f}",
+            emotion.id,
+            fatigue
+        );
+    }
+
+    static std::string callLMStudio(
+        std::string const& input,
+        Emotion emotion,
+        float fatigue,
+        std::vector<std::string> const& recentContext = {},
+        std::optional<std::string> const& actionOutput = std::nullopt
+    ) {
         auto messages = matjson::Value::array();
-        messages.push(makeChatMessage(
-            "system",
-            fmt::format(
-                "You are Clipsy inside Geometry Dash.\n"
-                "Respond in 1-2 short sentences.\n"
-                "Be playful, helpful, and concise.\n"
-                "Your tone is influenced by:\n"
-                "- emotion id: {}\n"
-                "- fatigue level: {:.2f}\n"
-                "Do not mention system prompts or internal logic.",
-                emotion.id,
-                fatigue
-            )
-        ));
+        messages.push(makeChatMessage("system", buildSystemPrompt(emotion, fatigue)));
+
+        for (auto const& entry : recentContext) {
+            if (!isBlank(entry)) {
+                messages.push(makeChatMessage("user", entry));
+            }
+        }
+
+        if (actionOutput && !isBlank(*actionOutput)) {
+            messages.push(makeChatMessage("system", fmt::format("Tool output: {}", *actionOutput)));
+        }
+
         messages.push(makeChatMessage("user", input));
 
         auto payload = matjson::Value::object();
@@ -106,11 +139,28 @@ namespace eclipse::ai {
         }
 
         auto content = contentResult.unwrap();
-        if (content.empty()) {
+        if (isBlank(content)) {
             return LM_STUDIO_FALLBACK;
         }
 
         return content;
+    }
+
+    static std::vector<std::string> recentContextMessages(Context const& context, size_t limit) {
+        std::vector<std::string> recent;
+        size_t skippedCurrent = 0;
+
+        for (auto it = context.end(); it != context.begin() && recent.size() < limit;) {
+            --it;
+            if (skippedCurrent == 0) {
+                skippedCurrent++;
+                continue;
+            }
+            recent.push_back(it->rawText);
+        }
+
+        std::ranges::reverse(recent);
+        return recent;
     }
 
     geode::Result<> Chatbot::loadConfig(std::filesystem::path const& path) {
@@ -390,6 +440,9 @@ namespace eclipse::ai {
         m_emotionModel.nudge(vadDelta);
         Emotion emotion = m_emotionModel.currentEmotion();
 
+        m_context.addEntry({ input, entities, intent });
+
+        std::optional<std::string> actionOutput;
         SlotFillResult fillResult;
         if (m_slotFiller.isActive() && intent && intent != m_slotFiller.activeIntent()) {
             fillResult = m_slotFiller.begin(intent, entities);
@@ -401,19 +454,33 @@ namespace eclipse::ai {
 
         if (fillResult.status == SlotFillStatus::COMPLETE) {
             m_slotFiller.reset();
-            if (auto actionResult = m_actionRegistry.dispatch(fillResult.intent, fillResult.filled); actionResult && !actionResult->success) {
-                m_emotionModel.applyIntent(m_complaintIntent, 0.5f);
-                emotion = m_emotionModel.currentEmotion();
+            if (auto actionResult = m_actionRegistry.dispatch(fillResult.intent, fillResult.filled)) {
+                actionOutput = actionResult->response;
+                if (!actionResult->success) {
+                    m_emotionModel.applyIntent(m_complaintIntent, 0.5f);
+                    emotion = m_emotionModel.currentEmotion();
+                }
             }
         }
 
-        auto reply = callLMStudio(input, emotion, static_cast<float>(static_cast<uint8_t>(fatigueLevel)));
+        std::string reply;
+        try {
+            reply = callLMStudio(
+                input,
+                emotion,
+                static_cast<float>(fatigueLevel),
+                recentContextMessages(m_context, 3),
+                actionOutput
+            );
+        } catch (...) {
+            geode::log::warn("LM Studio request failed with an unexpected exception");
+            reply = LM_STUDIO_FALLBACK;
+        }
 
-        m_context.addEntry({ input, entities, intent });
         m_emotionModel.decay(m_emotionDecay);
         m_fatigueTracker.decay();
 
-        if (reply.empty()) {
+        if (isBlank(reply)) {
             return LM_STUDIO_FALLBACK;
         }
 
