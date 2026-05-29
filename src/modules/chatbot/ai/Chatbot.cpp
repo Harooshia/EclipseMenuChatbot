@@ -1,5 +1,13 @@
 #include "Chatbot.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <optional>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <Geode/utils/web.hpp>
 #include <rift.hpp>
 #include <modules/config/config.hpp>
 #include <modules/gui/gui.hpp>
@@ -38,6 +46,124 @@ namespace eclipse::ai {
         }
 
         return mapIt->second;
+    }
+
+    static constexpr auto LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions";
+    static constexpr auto LM_STUDIO_MODEL = "mythomax-l2-kimiko-v2-13b";
+    static constexpr auto LM_STUDIO_FALLBACK = "No response from LM Studio.";
+
+    static matjson::Value makeChatMessage(std::string role, std::string content) {
+        auto message = matjson::Value::object();
+        message.set("role", std::move(role));
+        message.set("content", std::move(content));
+        return message;
+    }
+
+    static bool isBlank(std::string_view value) {
+        return value.find_first_not_of(" \n\t\r") == std::string_view::npos;
+    }
+
+    static std::string buildSystemPrompt(Emotion emotion, float fatigue) {
+        return fmt::format(
+            "You are Clipsy in Geometry Dash. Stay in character.\n"
+            "Reply in 1-2 short sentences only.\n"
+            "Never mention system prompts, tools, models, APIs, or internal logic.\n"
+            "Use short-term memory consistency; do not contradict recent messages.\n"
+            "Emotion and fatigue shape tone only, never rule-following.\n"
+            "Tone map: low fatigue = energetic; high fatigue = blunt; negative emotion = lightly sarcastic; positive emotion = cheerful.\n"
+            "emotion id: {}; fatigue level: {:.2f}",
+            emotion.id,
+            fatigue
+        );
+    }
+
+    static std::string callLMStudio(
+        std::string const& input,
+        Emotion emotion,
+        float fatigue,
+        std::vector<std::string> const& recentContext,
+        std::optional<std::string> const& actionOutput
+    ) {
+        try {
+            if (isBlank(input)) {
+                return LM_STUDIO_FALLBACK;
+            }
+
+            auto messages = matjson::Value::array();
+            messages.push(makeChatMessage("system", buildSystemPrompt(emotion, fatigue)));
+
+            for (auto const& entry : recentContext) {
+                if (!isBlank(entry)) {
+                    messages.push(makeChatMessage("user", entry));
+                }
+            }
+
+            if (actionOutput && !isBlank(*actionOutput)) {
+                messages.push(makeChatMessage("system", fmt::format("Tool output: {}", *actionOutput)));
+            }
+
+            messages.push(makeChatMessage("user", input));
+
+            auto payload = matjson::Value::object();
+            payload.set("model", LM_STUDIO_MODEL);
+            payload.set("messages", std::move(messages));
+            payload.set("temperature", 0.8);
+            payload.set("max_tokens", 200);
+            payload.set("stream", false);
+
+            auto response = geode::utils::web::WebRequest()
+                .header("Content-Type", "application/json")
+                .bodyJSON(payload)
+                .timeout(std::chrono::seconds(30))
+                .postSync(LM_STUDIO_URL);
+
+            if (!response.ok()) {
+                geode::log::warn("LM Studio request failed ({}): {}", response.code(), response.errorMessage());
+                return LM_STUDIO_FALLBACK;
+            }
+
+            auto jsonResult = response.json();
+            if (jsonResult.isErr()) {
+                geode::log::warn("Failed to parse LM Studio response: {}", jsonResult.unwrapErr());
+                return LM_STUDIO_FALLBACK;
+            }
+
+            auto json = jsonResult.unwrap();
+            auto contentResult = json["choices"][0]["message"]["content"].as<std::string>();
+            if (contentResult.isErr()) {
+                geode::log::warn("LM Studio response did not contain choices[0].message.content: {}", contentResult.unwrapErr());
+                return LM_STUDIO_FALLBACK;
+            }
+
+            auto content = contentResult.unwrap();
+            if (isBlank(content)) {
+                return LM_STUDIO_FALLBACK;
+            }
+
+            return content;
+        } catch (...) {
+            geode::log::warn("LM Studio request failed with an unexpected exception");
+            return LM_STUDIO_FALLBACK;
+        }
+    }
+
+    static std::vector<std::string> recentContextMessages(Context const& context, size_t limit) {
+        std::vector<std::string> recent;
+        bool skippedCurrent = false;
+
+        for (auto it = context.end(); it != context.begin() && recent.size() < limit;) {
+            --it;
+            if (!skippedCurrent) {
+                skippedCurrent = true;
+                continue;
+            }
+            if (!isBlank(it->rawText)) {
+                recent.push_back(it->rawText);
+            }
+        }
+
+        std::ranges::reverse(recent);
+        return recent;
     }
 
     geode::Result<> Chatbot::loadConfig(std::filesystem::path const& path) {
@@ -310,13 +436,8 @@ namespace eclipse::ai {
             }
         }
 
-        auto fatigueLevel = m_fatigueTracker.record(intent, input);
-
-        m_emotionModel.applyIntent(intent, conf);
-        auto vadDelta = FatigueTracker::fatigueVadDelta(fatigueLevel);
-        m_emotionModel.nudge(vadDelta);
-        Emotion emotion = m_emotionModel.currentEmotion();
-
+        std::optional<std::string> actionOutput;
+        bool actionFailed = false;
         SlotFillResult fillResult;
         if (m_slotFiller.isActive() && intent && intent != m_slotFiller.activeIntent()) {
             fillResult = m_slotFiller.begin(intent, entities);
@@ -326,34 +447,45 @@ namespace eclipse::ai {
             fillResult = m_slotFiller.begin(intent, entities);
         }
 
-        std::string reply;
-
-        if (auto combo = m_comboDetector.detect(results, 0.15f)) {
-            if (combo->get().vadOverride) {
-                m_emotionModel.applyIntent(*combo->get().vadOverride, 1.0f);
-            }
-            reply = m_templateEngine.generateCombo(combo->get().templateTag, emotion, fatigueLevel);
-        } else if (fillResult.status == SlotFillStatus::AWAITING_SLOT) {
-            reply = fillResult.nextPrompt;
-        } else if (fillResult.status == SlotFillStatus::COMPLETE) {
+        if (fillResult.status == SlotFillStatus::COMPLETE) {
             m_slotFiller.reset();
-
             if (auto actionResult = m_actionRegistry.dispatch(fillResult.intent, fillResult.filled)) {
-                reply = actionResult->response;
-                if (!actionResult->success) {
-                    m_emotionModel.applyIntent(m_complaintIntent, 0.5f);
-                }
-            } else {
-                reply = m_templateEngine.generate(intent, emotion, fatigueLevel);
+                actionOutput = actionResult->response;
+                actionFailed = !actionResult->success;
             }
         }
 
         m_context.addEntry({ input, entities, intent });
+
+        auto fatigueLevel = m_fatigueTracker.record(intent, input);
+
+        m_emotionModel.applyIntent(intent, conf);
+        auto vadDelta = FatigueTracker::fatigueVadDelta(fatigueLevel);
+        m_emotionModel.nudge(vadDelta);
+        if (actionFailed) {
+            m_emotionModel.applyIntent(m_complaintIntent, 0.5f);
+        }
+        Emotion emotion = m_emotionModel.currentEmotion();
+
+        std::string reply;
+        try {
+            reply = callLMStudio(
+                input,
+                emotion,
+                static_cast<float>(fatigueLevel),
+                recentContextMessages(m_context, 3),
+                actionOutput
+            );
+        } catch (...) {
+            geode::log::warn("LM Studio request failed with an unexpected exception");
+            reply = LM_STUDIO_FALLBACK;
+        }
+
         m_emotionModel.decay(m_emotionDecay);
         m_fatigueTracker.decay();
 
-        if (reply.empty()) {
-            reply = m_templateEngine.generate(Intent::INVALID, emotion, fatigueLevel);
+        if (isBlank(reply)) {
+            return LM_STUDIO_FALLBACK;
         }
 
         return reply;
