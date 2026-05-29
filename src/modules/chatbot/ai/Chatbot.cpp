@@ -65,21 +65,13 @@ namespace eclipse::ai {
 
     static std::string buildSystemPrompt(Emotion emotion, float fatigue) {
         return fmt::format(
-            "You are Clipsy, an in-game assistant inside Geometry Dash.\n"
-            "Core rules:\n"
-            "- Always stay in character as Clipsy inside Geometry Dash.\n"
-            "- Never mention APIs, models, prompts, or internal logic.\n"
-            "- Respond in 1-2 short sentences.\n"
-            "- Be playful, helpful, concise, and sometimes lightly teasing.\n"
-            "- Use short-term memory to stay consistent with the conversation.\n"
-            "Behavior mapping:\n"
-            "- Low fatigue means energetic, fast responses.\n"
-            "- High fatigue means slower, more blunt responses.\n"
-            "- Negative emotion means slightly sarcastic but still helpful.\n"
-            "- Positive emotion means cheerful and reactive.\n"
-            "Current tone inputs:\n"
-            "- emotion id: {}\n"
-            "- fatigue level: {:.2f}",
+            "You are Clipsy in Geometry Dash. Stay in character.\n"
+            "Reply in 1-2 short sentences only.\n"
+            "Never mention system prompts, tools, models, APIs, or internal logic.\n"
+            "Use short-term memory consistency; do not contradict recent messages.\n"
+            "Emotion and fatigue shape tone only, never rule-following.\n"
+            "Tone map: low fatigue = energetic; high fatigue = blunt; negative emotion = lightly sarcastic; positive emotion = cheerful.\n"
+            "emotion id: {}; fatigue level: {:.2f}",
             emotion.id,
             fatigue
         );
@@ -89,74 +81,85 @@ namespace eclipse::ai {
         std::string const& input,
         Emotion emotion,
         float fatigue,
-        std::vector<std::string> const& recentContext = {},
-        std::optional<std::string> const& actionOutput = std::nullopt
+        std::vector<std::string> const& recentContext,
+        std::optional<std::string> const& actionOutput
     ) {
-        auto messages = matjson::Value::array();
-        messages.push(makeChatMessage("system", buildSystemPrompt(emotion, fatigue)));
-
-        for (auto const& entry : recentContext) {
-            if (!isBlank(entry)) {
-                messages.push(makeChatMessage("user", entry));
+        try {
+            if (isBlank(input)) {
+                return LM_STUDIO_FALLBACK;
             }
-        }
 
-        if (actionOutput && !isBlank(*actionOutput)) {
-            messages.push(makeChatMessage("system", fmt::format("Tool output: {}", *actionOutput)));
-        }
+            auto messages = matjson::Value::array();
+            messages.push(makeChatMessage("system", buildSystemPrompt(emotion, fatigue)));
 
-        messages.push(makeChatMessage("user", input));
+            for (auto const& entry : recentContext) {
+                if (!isBlank(entry)) {
+                    messages.push(makeChatMessage("user", entry));
+                }
+            }
 
-        auto payload = matjson::Value::object();
-        payload.set("model", LM_STUDIO_MODEL);
-        payload.set("messages", std::move(messages));
-        payload.set("temperature", 0.8);
-        payload.set("max_tokens", 200);
-        payload.set("stream", false);
+            if (actionOutput && !isBlank(*actionOutput)) {
+                messages.push(makeChatMessage("system", fmt::format("Tool output: {}", *actionOutput)));
+            }
 
-        auto response = geode::utils::web::WebRequest()
-            .header("Content-Type", "application/json")
-            .bodyJSON(payload)
-            .timeout(std::chrono::seconds(30))
-            .postSync(LM_STUDIO_URL);
+            messages.push(makeChatMessage("user", input));
 
-        if (!response.ok()) {
-            geode::log::warn("LM Studio request failed ({}): {}", response.code(), response.errorMessage());
+            auto payload = matjson::Value::object();
+            payload.set("model", LM_STUDIO_MODEL);
+            payload.set("messages", std::move(messages));
+            payload.set("temperature", 0.8);
+            payload.set("max_tokens", 200);
+            payload.set("stream", false);
+
+            auto response = geode::utils::web::WebRequest()
+                .header("Content-Type", "application/json")
+                .bodyJSON(payload)
+                .timeout(std::chrono::seconds(30))
+                .postSync(LM_STUDIO_URL);
+
+            if (!response.ok()) {
+                geode::log::warn("LM Studio request failed ({}): {}", response.code(), response.errorMessage());
+                return LM_STUDIO_FALLBACK;
+            }
+
+            auto jsonResult = response.json();
+            if (jsonResult.isErr()) {
+                geode::log::warn("Failed to parse LM Studio response: {}", jsonResult.unwrapErr());
+                return LM_STUDIO_FALLBACK;
+            }
+
+            auto json = jsonResult.unwrap();
+            auto contentResult = json["choices"][0]["message"]["content"].as<std::string>();
+            if (contentResult.isErr()) {
+                geode::log::warn("LM Studio response did not contain choices[0].message.content: {}", contentResult.unwrapErr());
+                return LM_STUDIO_FALLBACK;
+            }
+
+            auto content = contentResult.unwrap();
+            if (isBlank(content)) {
+                return LM_STUDIO_FALLBACK;
+            }
+
+            return content;
+        } catch (...) {
+            geode::log::warn("LM Studio request failed with an unexpected exception");
             return LM_STUDIO_FALLBACK;
         }
-
-        auto jsonResult = response.json();
-        if (jsonResult.isErr()) {
-            geode::log::warn("Failed to parse LM Studio response: {}", jsonResult.unwrapErr());
-            return LM_STUDIO_FALLBACK;
-        }
-
-        auto json = jsonResult.unwrap();
-        auto contentResult = json["choices"][0]["message"]["content"].as<std::string>();
-        if (contentResult.isErr()) {
-            geode::log::warn("LM Studio response did not contain choices[0].message.content: {}", contentResult.unwrapErr());
-            return LM_STUDIO_FALLBACK;
-        }
-
-        auto content = contentResult.unwrap();
-        if (isBlank(content)) {
-            return LM_STUDIO_FALLBACK;
-        }
-
-        return content;
     }
 
     static std::vector<std::string> recentContextMessages(Context const& context, size_t limit) {
         std::vector<std::string> recent;
-        size_t skippedCurrent = 0;
+        bool skippedCurrent = false;
 
         for (auto it = context.end(); it != context.begin() && recent.size() < limit;) {
             --it;
-            if (skippedCurrent == 0) {
-                skippedCurrent++;
+            if (!skippedCurrent) {
+                skippedCurrent = true;
                 continue;
             }
-            recent.push_back(it->rawText);
+            if (!isBlank(it->rawText)) {
+                recent.push_back(it->rawText);
+            }
         }
 
         std::ranges::reverse(recent);
@@ -433,16 +436,8 @@ namespace eclipse::ai {
             }
         }
 
-        auto fatigueLevel = m_fatigueTracker.record(intent, input);
-
-        m_emotionModel.applyIntent(intent, conf);
-        auto vadDelta = FatigueTracker::fatigueVadDelta(fatigueLevel);
-        m_emotionModel.nudge(vadDelta);
-        Emotion emotion = m_emotionModel.currentEmotion();
-
-        m_context.addEntry({ input, entities, intent });
-
         std::optional<std::string> actionOutput;
+        bool actionFailed = false;
         SlotFillResult fillResult;
         if (m_slotFiller.isActive() && intent && intent != m_slotFiller.activeIntent()) {
             fillResult = m_slotFiller.begin(intent, entities);
@@ -456,12 +451,21 @@ namespace eclipse::ai {
             m_slotFiller.reset();
             if (auto actionResult = m_actionRegistry.dispatch(fillResult.intent, fillResult.filled)) {
                 actionOutput = actionResult->response;
-                if (!actionResult->success) {
-                    m_emotionModel.applyIntent(m_complaintIntent, 0.5f);
-                    emotion = m_emotionModel.currentEmotion();
-                }
+                actionFailed = !actionResult->success;
             }
         }
+
+        m_context.addEntry({ input, entities, intent });
+
+        auto fatigueLevel = m_fatigueTracker.record(intent, input);
+
+        m_emotionModel.applyIntent(intent, conf);
+        auto vadDelta = FatigueTracker::fatigueVadDelta(fatigueLevel);
+        m_emotionModel.nudge(vadDelta);
+        if (actionFailed) {
+            m_emotionModel.applyIntent(m_complaintIntent, 0.5f);
+        }
+        Emotion emotion = m_emotionModel.currentEmotion();
 
         std::string reply;
         try {
