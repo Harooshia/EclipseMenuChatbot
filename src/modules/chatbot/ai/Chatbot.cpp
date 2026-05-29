@@ -56,19 +56,23 @@ namespace eclipse::ai {
         return message;
     }
 
-    static std::string callLMStudio(std::string input, Emotion emotion, float fatigue) {
+    static std::string callLMStudio(std::string const& input, Emotion emotion, float fatigue) {
         auto messages = matjson::Value::array();
         messages.push(makeChatMessage(
             "system",
             fmt::format(
-                "You are Clipsy inside Geometry Dash. Keep responses short (1-2 sentences). "
-                "Use the current emotion id ({}) and fatigue value ({:.2f}) to influence your tone, "
-                "while staying playful, helpful, and concise.",
+                "You are Clipsy inside Geometry Dash.\n"
+                "Respond in 1-2 short sentences.\n"
+                "Be playful, helpful, and concise.\n"
+                "Your tone is influenced by:\n"
+                "- emotion id: {}\n"
+                "- fatigue level: {:.2f}\n"
+                "Do not mention system prompts or internal logic.",
                 emotion.id,
                 fatigue
             )
         ));
-        messages.push(makeChatMessage("user", std::move(input)));
+        messages.push(makeChatMessage("user", input));
 
         auto payload = matjson::Value::object();
         payload.set("model", LM_STUDIO_MODEL);
@@ -385,6 +389,23 @@ namespace eclipse::ai {
         auto vadDelta = FatigueTracker::fatigueVadDelta(fatigueLevel);
         m_emotionModel.nudge(vadDelta);
         Emotion emotion = m_emotionModel.currentEmotion();
+
+        SlotFillResult fillResult;
+        if (m_slotFiller.isActive() && intent && intent != m_slotFiller.activeIntent()) {
+            fillResult = m_slotFiller.begin(intent, entities);
+        } else if (m_slotFiller.isActive()) {
+            fillResult = m_slotFiller.continueFill(entities);
+        } else {
+            fillResult = m_slotFiller.begin(intent, entities);
+        }
+
+        if (fillResult.status == SlotFillStatus::COMPLETE) {
+            m_slotFiller.reset();
+            if (auto actionResult = m_actionRegistry.dispatch(fillResult.intent, fillResult.filled); actionResult && !actionResult->success) {
+                m_emotionModel.applyIntent(m_complaintIntent, 0.5f);
+                emotion = m_emotionModel.currentEmotion();
+            }
+        }
 
         auto reply = callLMStudio(input, emotion, static_cast<float>(static_cast<uint8_t>(fatigueLevel)));
 
