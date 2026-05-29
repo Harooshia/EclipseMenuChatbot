@@ -1,5 +1,10 @@
 #include "Chatbot.hpp"
 
+#include <chrono>
+#include <cstdint>
+#include <utility>
+
+#include <Geode/utils/web.hpp>
 #include <rift.hpp>
 #include <modules/config/config.hpp>
 #include <modules/gui/gui.hpp>
@@ -38,6 +43,74 @@ namespace eclipse::ai {
         }
 
         return mapIt->second;
+    }
+
+    static constexpr auto LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions";
+    static constexpr auto LM_STUDIO_MODEL = "mythomax-l2-kimiko-v2-13b";
+    static constexpr auto LM_STUDIO_FALLBACK = "No response from LM Studio.";
+
+    static matjson::Value makeChatMessage(std::string role, std::string content) {
+        auto message = matjson::Value::object();
+        message.set("role", std::move(role));
+        message.set("content", std::move(content));
+        return message;
+    }
+
+    static std::string callLMStudio(std::string const& input, Emotion emotion, float fatigue) {
+        auto messages = matjson::Value::array();
+        messages.push(makeChatMessage(
+            "system",
+            fmt::format(
+                "You are Clipsy inside Geometry Dash.\n"
+                "Respond in 1-2 short sentences.\n"
+                "Be playful, helpful, and concise.\n"
+                "Your tone is influenced by:\n"
+                "- emotion id: {}\n"
+                "- fatigue level: {:.2f}\n"
+                "Do not mention system prompts or internal logic.",
+                emotion.id,
+                fatigue
+            )
+        ));
+        messages.push(makeChatMessage("user", input));
+
+        auto payload = matjson::Value::object();
+        payload.set("model", LM_STUDIO_MODEL);
+        payload.set("messages", std::move(messages));
+        payload.set("temperature", 0.8);
+        payload.set("max_tokens", 200);
+        payload.set("stream", false);
+
+        auto response = geode::utils::web::WebRequest()
+            .header("Content-Type", "application/json")
+            .bodyJSON(payload)
+            .timeout(std::chrono::seconds(30))
+            .postSync(LM_STUDIO_URL);
+
+        if (!response.ok()) {
+            geode::log::warn("LM Studio request failed ({}): {}", response.code(), response.errorMessage());
+            return LM_STUDIO_FALLBACK;
+        }
+
+        auto jsonResult = response.json();
+        if (jsonResult.isErr()) {
+            geode::log::warn("Failed to parse LM Studio response: {}", jsonResult.unwrapErr());
+            return LM_STUDIO_FALLBACK;
+        }
+
+        auto json = jsonResult.unwrap();
+        auto contentResult = json["choices"][0]["message"]["content"].as<std::string>();
+        if (contentResult.isErr()) {
+            geode::log::warn("LM Studio response did not contain choices[0].message.content: {}", contentResult.unwrapErr());
+            return LM_STUDIO_FALLBACK;
+        }
+
+        auto content = contentResult.unwrap();
+        if (content.empty()) {
+            return LM_STUDIO_FALLBACK;
+        }
+
+        return content;
     }
 
     geode::Result<> Chatbot::loadConfig(std::filesystem::path const& path) {
@@ -326,34 +399,22 @@ namespace eclipse::ai {
             fillResult = m_slotFiller.begin(intent, entities);
         }
 
-        std::string reply;
-
-        if (auto combo = m_comboDetector.detect(results, 0.15f)) {
-            if (combo->get().vadOverride) {
-                m_emotionModel.applyIntent(*combo->get().vadOverride, 1.0f);
-            }
-            reply = m_templateEngine.generateCombo(combo->get().templateTag, emotion, fatigueLevel);
-        } else if (fillResult.status == SlotFillStatus::AWAITING_SLOT) {
-            reply = fillResult.nextPrompt;
-        } else if (fillResult.status == SlotFillStatus::COMPLETE) {
+        if (fillResult.status == SlotFillStatus::COMPLETE) {
             m_slotFiller.reset();
-
-            if (auto actionResult = m_actionRegistry.dispatch(fillResult.intent, fillResult.filled)) {
-                reply = actionResult->response;
-                if (!actionResult->success) {
-                    m_emotionModel.applyIntent(m_complaintIntent, 0.5f);
-                }
-            } else {
-                reply = m_templateEngine.generate(intent, emotion, fatigueLevel);
+            if (auto actionResult = m_actionRegistry.dispatch(fillResult.intent, fillResult.filled); actionResult && !actionResult->success) {
+                m_emotionModel.applyIntent(m_complaintIntent, 0.5f);
+                emotion = m_emotionModel.currentEmotion();
             }
         }
+
+        auto reply = callLMStudio(input, emotion, static_cast<float>(static_cast<uint8_t>(fatigueLevel)));
 
         m_context.addEntry({ input, entities, intent });
         m_emotionModel.decay(m_emotionDecay);
         m_fatigueTracker.decay();
 
         if (reply.empty()) {
-            reply = m_templateEngine.generate(Intent::INVALID, emotion, fatigueLevel);
+            return LM_STUDIO_FALLBACK;
         }
 
         return reply;
